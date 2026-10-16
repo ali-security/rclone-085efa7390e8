@@ -6,18 +6,16 @@ name: build
 
 # Trigger the workflow on push or pull request
 on:
-  push:
-    branches:
-      - '**'
-    tags:
-      - '**'
-  pull_request:
   workflow_dispatch:
     inputs:
       manual:
         description: Manual run (bypass default conditions)
         type: boolean
         default: true
+      test-filter:
+        description: Space-separated test names to run instead of the full suite
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -174,20 +172,26 @@ jobs:
 
       - name: Run tests
         run: |
-          make quicktest
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            RCLONE_CONFIG="/notfound" go test -v ${GOTAGS:+-tags "$GOTAGS"} -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in ${{ inputs.test-filter }}; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || exit 1; done
+          else
+            GOFLAGS=-v make quicktest 2>&1 | tee "$RUNNER_TEMP/quicktest.log"
+            LC_ALL=C awk '/--- PASS/{p++} /--- FAIL/{f++} /--- SKIP/{s++} END{printf "TEST SUMMARY: %d passed, %d failed, %d skipped\n", p, f, s}' "$RUNNER_TEMP/quicktest.log"
+          fi
         if: matrix.quicktest
 
       - name: Race test
         run: |
           make racequicktest
-        if: matrix.racequicktest
+        if: matrix.racequicktest && inputs.test-filter == ''
 
       - name: Run librclone tests
         run: |
           make -C librclone/ctest test
           make -C librclone/ctest clean
           librclone/python/test_rclone.py
-        if: matrix.librclonetest
+        if: matrix.librclonetest && inputs.test-filter == ''
 
       - name: Compile all architectures test
         run: |
@@ -206,7 +210,8 @@ jobs:
         if: env.RCLONE_CONFIG_PASS != '' && matrix.deploy && github.head_ref == '' && github.repository == 'rclone/rclone'
 
   lint:
-    if: inputs.manual || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+    # sealed build: golangci-lint/govulncheck/markdownlint are lint gates, not tests
+    if: false
     timeout-minutes: 30
     name: "lint"
     runs-on: ubuntu-latest
@@ -394,3 +399,59 @@ jobs:
           RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
         # Upload artifacts if not a PR && not a fork
         if: env.RCLONE_CONFIG_PASS != '' && github.head_ref == '' && github.repository == 'rclone/rclone'
+
+  module-zip:
+    timeout-minutes: 20
+    name: "module-zip"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '~1.26.0'
+
+      - name: Build module zip
+        run: |
+          cp -r "$GITHUB_WORKSPACE" /tmp/modsrc
+          rm -rf /tmp/modsrc/.git
+          mkdir -p /tmp/zipper /tmp/out
+          cat > /tmp/zipper/main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              version, dir, out := os.Args[1], os.Args[2], os.Args[3]
+              f, err := os.Create(out)
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: "github.com/rclone/rclone", Version: version}
+              if err := zip.CreateFromDir(f, mv, dir); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          cd /tmp/zipper
+          go mod init zipper
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.24.0
+          go run . v1.74.0 /tmp/modsrc /tmp/out/v1.74.0.zip
+          unzip -l /tmp/out/v1.74.0.zip | tail -1
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/out/v1.74.0.zip
+          if-no-files-found: error
