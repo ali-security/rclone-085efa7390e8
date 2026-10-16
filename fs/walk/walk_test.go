@@ -670,6 +670,30 @@ a/b2/
 	}
 }
 
+// TestWalkRDirTreeConfinement checks that entries escaping the root
+// are dropped from a recursive ListR directory tree, even with
+// includeAll set.
+func TestWalkRDirTreeConfinement(t *testing.T) {
+	ctx := context.Background()
+	entries := fs.DirEntries{
+		mockobject.Object("ok"),
+		mockobject.Object(".."),
+		mockobject.Object("../escape"),
+		mockdir.New("../evildir"),
+		mockobject.Object("a/../../x"),
+		mockobject.Object("/../slashescape"),
+		mockobject.Object("dir/file"),
+	}
+	r, err := walkRDirTree(ctx, nil, "", true, -1, makeListRCallback(entries, nil))
+	require.NoError(t, err)
+	assert.Equal(t, `/
+  dir/
+  ok
+dir/
+  file
+`, r.String())
+}
+
 func TestWalkRDirTreeExclude(t *testing.T) {
 	ctx := context.Background()
 	fi := filter.GetConfig(ctx)
@@ -786,6 +810,73 @@ func TestListType(t *testing.T) {
 	got = copyOrigEntries()
 	ListDirs.Filter(&got)
 	assert.Equal(t, dirEntries, got)
+}
+
+func TestListRConfinement(t *testing.T) {
+	ctx := context.Background()
+	f, err := mockfs.NewFs(ctx, "mock", "/", nil)
+	require.NoError(t, err)
+	objects := fs.DirEntries{
+		mockobject.Object("ok"),
+		mockobject.Object(".."),
+		mockobject.Object("../escape"),
+		mockdir.New("../evildir"),
+		// leading-slash climbers: filterDir doesn't guard the ListR path, so
+		// these reach RemoveEscaping directly and must still be dropped.
+		mockobject.Object("/../slashescape"),
+		mockobject.Object("//../../slashescape2"),
+		mockobject.Object("dir/deep"),
+	}
+	var got []string
+	callback := func(entries fs.DirEntries) error {
+		for _, entry := range entries {
+			got = append(got, entry.Remote())
+		}
+		return nil
+	}
+	doListR := func(ctx context.Context, dir string, callback fs.ListRCallback) error {
+		return callback(objects)
+	}
+	// includeAll = true exercises the unconditional confinement - the
+	// include/exclude filter block is skipped in this mode, so an escaping
+	// entry would otherwise pass straight through.
+	err = listR(ctx, f, "", true, ListAll, callback, doListR, false)
+	require.NoError(t, err)
+	require.Equal(t, []string{"ok", "dir/deep"}, got)
+}
+
+// TestListRConfinementSynthesizeDirs checks that the parent directories
+// of escaping entries are not synthesized (as done for bucket-based
+// remotes) and sent - eg ".." for "../escape".
+func TestListRConfinementSynthesizeDirs(t *testing.T) {
+	ctx := context.Background()
+	f, err := mockfs.NewFs(ctx, "mock", "/", nil)
+	require.NoError(t, err)
+	objects := fs.DirEntries{
+		mockobject.Object("ok/file"),
+		mockobject.Object("../escape"),
+		mockobject.Object("a/../../up/x"), // parent cleans to "../up"
+		mockdir.New("../evildir"),
+	}
+	var got []string
+	callback := func(entries fs.DirEntries) error {
+		for _, entry := range entries {
+			got = append(got, entry.Remote())
+		}
+		return nil
+	}
+	doListR := func(ctx context.Context, dir string, callback fs.ListRCallback) error {
+		return callback(objects)
+	}
+
+	err = listR(ctx, f, "", true, ListAll, callback, doListR, true)
+	require.NoError(t, err)
+	require.Equal(t, []string{"ok/file", "ok"}, got)
+
+	got = nil
+	err = listR(ctx, f, "", true, ListDirs, callback, doListR, true)
+	require.NoError(t, err)
+	require.Equal(t, []string{"ok"}, got)
 }
 
 func TestListR(t *testing.T) {

@@ -298,6 +298,10 @@ func listR(ctx context.Context, f fs.Fs, path string, includeAll bool, listType 
 	var mu sync.Mutex
 	err := doListR(ctx, path, func(entries fs.DirEntries) (err error) {
 		accounting.Stats(ctx).Listed(int64(len(entries)))
+		// Drop escaping entries before synthesizing directories so
+		// that their parents (eg ".." for "../x") are never made up
+		// and sent either.
+		entries = list.RemoveEscaping(entries)
 		if synthesizeDirs {
 			err = dm.addEntries(entries)
 			if err != nil {
@@ -466,6 +470,7 @@ func walkRDirTree(ctx context.Context, f fs.Fs, startPath string, includeAll boo
 	var mu sync.Mutex
 	err := listR(ctx, startPath, func(entries fs.DirEntries) error {
 		accounting.Stats(ctx).Listed(int64(len(entries)))
+		entries = list.RemoveEscaping(entries)
 		mu.Lock()
 		defer mu.Unlock()
 		for _, entry := range entries {

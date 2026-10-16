@@ -13,6 +13,53 @@ import (
 	"github.com/rclone/rclone/lib/bucket"
 )
 
+// RemoteEscapesRoot reports whether remote, taken as a path relative to an Fs
+// root, climbs above that root when joined onto it.
+//
+// It mirrors what the backends actually do - path.Join(root, remote) - by
+// walking the "/" separated segments of remote the way path.Join cleans them
+// ("" and "." are dropped, ".." removes the previous segment) and checking
+// whether a ".." ever climbs above the root. This is independent of what root
+// is, so no name - whatever bytes it contains - can be mistaken for the root.
+//
+// A well behaved backend never produces such a name; one can arise from a
+// malicious or buggy server (an object store permits keys containing ".."),
+// and acting on it would let a listing or transfer escape the configured root.
+func RemoteEscapesRoot(remote string) bool {
+	depth := 0
+	for _, segment := range strings.Split(remote, "/") {
+		switch segment {
+		case "", ".":
+			// ignored by path.Join
+		case "..":
+			depth--
+			if depth < 0 {
+				return true
+			}
+		default:
+			depth++
+		}
+	}
+	return false
+}
+
+// RemoveEscaping drops - and logs - any entries whose Remote escapes the Fs
+// root (see RemoteEscapesRoot), filtering the slice in place. It is applied to
+// every listing unconditionally, independent of the include/exclude filters, so
+// that names which cannot be safely confined are never surfaced to any
+// operation.
+func RemoveEscaping(entries fs.DirEntries) fs.DirEntries {
+	kept := entries[:0]
+	for _, entry := range entries {
+		if RemoteEscapesRoot(entry.Remote()) {
+			fs.Errorf(entry, "Entry %q escapes the root - ignoring", entry.Remote())
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept
+}
+
 // DirSorted reads Object and *Dir into entries for the given Fs.
 //
 // dir is the start directory, "" for root
@@ -99,6 +146,7 @@ func DirSortedFn(ctx context.Context, f fs.Fs, includeAll bool, dir string, call
 func filterDir(ctx context.Context, entries fs.DirEntries, includeAll bool, dir string,
 	IncludeObject func(ctx context.Context, o fs.Object) bool,
 	IncludeDirectory func(remote string) (bool, error)) (newEntries fs.DirEntries, err error) {
+	entries = RemoveEscaping(entries)
 	newEntries = entries[:0] // in place filter
 	prefix := ""
 	if dir != "" {
