@@ -291,6 +291,43 @@ func TestListBucketsAuthProxy(t *testing.T) {
 	testListBuckets(t, cases, true)
 }
 
+// TestNewServerPerServerAuthProxy checks that a per-server proxyOpt.AuthProxy
+// enables proxy mode even when the process-global proxy.Opt.AuthProxy is empty,
+// which is the normal case when the server is configured via serve/start.
+//
+// If it didn't, the remote would be served with a fixed VFS and no
+// authentication.
+func TestNewServerPerServerAuthProxy(t *testing.T) {
+	// Ensure the global is empty so we only test the per-server option.
+	assert.Equal(t, "", proxy.Opt.AuthProxy)
+
+	fstest.Initialise()
+	ctx := context.Background()
+	f, err := fs.NewFs(ctx, "testdata")
+	require.NoError(t, err)
+
+	opt := Opt
+	opt.HTTP.ListenAddr = []string{endpoint}
+
+	proxyOpt := proxy.Opt
+	proxyOpt.AuthProxy = "/path/to/auth/proxy"
+
+	w, err := newServer(ctx, f, &opt, &vfscommon.Opt, &proxyOpt)
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, w.Shutdown())
+	}()
+	assert.True(t, w.provider.IsProxy(), "expected auth proxy to be enabled by per-server option")
+	assert.Nil(t, w.provider.VFS(), "expected no fixed VFS when auth proxy is in use")
+
+	// A request which wasn't authorized by the proxy must not get a VFS
+	VFS, err := w.getVFS(ctx)
+	assert.Error(t, err)
+	assert.Nil(t, VFS)
+	_, err = newBackend(w).ListBuckets(ctx)
+	assert.Error(t, err, "expected anonymous bucket listing to be refused")
+}
+
 func TestRc(t *testing.T) {
 	servetest.TestRc(t, rc.Params{
 		"type":           "s3",
