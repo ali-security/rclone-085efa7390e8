@@ -7,12 +7,15 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -81,7 +84,7 @@ func TestRun(t *testing.T) {
 		defer p.vfsCache.Clear()
 
 		passwordBytes := []byte(testPass)
-		value, err := p.call(testUser, testPass, false)
+		value, err := p.call(testUser, testPass, authPassword)
 		require.NoError(t, err)
 		entry, ok := value.(cacheEntry)
 		require.True(t, ok)
@@ -164,7 +167,7 @@ func TestRun(t *testing.T) {
 		assert.Equal(t, 0, p.vfsCache.Entries())
 		defer p.vfsCache.Clear()
 
-		value, err := p.call(testUser, publicKeyString, true)
+		value, err := p.call(testUser, publicKeyString, authPublicKey)
 		require.NoError(t, err)
 		entry, ok := value.(cacheEntry)
 		require.True(t, ok)
@@ -233,4 +236,141 @@ func TestRun(t *testing.T) {
 		// check cache is at the same level
 		assert.Equal(t, 1, p.vfsCache.Entries())
 	})
+}
+
+// TestCallAccessKeyConcurrentRefresh checks that concurrent refreshes
+// which all see a rotated secret end up sharing one backend and one
+// cache entry rather than the later ones retiring the entry an
+// earlier one created and returned.
+func TestCallAccessKeyConcurrentRefresh(t *testing.T) {
+	opt := Opt
+	opt.AuthProxy = "go run proxy_code.go"
+	p := New(context.Background(), &opt, &vfscommon.Opt)
+	defer p.Shutdown()
+
+	oldInterval := accessKeyRefreshInterval
+	accessKeyRefreshInterval = 0
+	defer func() { accessKeyRefreshInterval = oldInterval }()
+
+	VFS, _, err := p.CallAccessKey("CONCURRENT", false)
+	require.NoError(t, err)
+
+	// Rotate the secret then refresh from many goroutines at once
+	t.Setenv("RCLONE_TEST_PROXY_SECRET_SUFFIX", "-rotated")
+	const n = 8
+	results := make([]*vfs.VFS, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			newVFS, secret, err := p.CallAccessKey("CONCURRENT", true)
+			assert.NoError(t, err)
+			assert.Equal(t, "CONCURRENT-rotated", secret)
+			results[i] = newVFS
+		}()
+	}
+	wg.Wait()
+
+	// Every caller must have got the same backend and only one
+	// entry was retired
+	for i := range n {
+		assert.Same(t, VFS, results[i], "goroutine %d got a different backend", i)
+	}
+	assert.Equal(t, 2, p.vfsCache.Entries())
+}
+
+func TestCallAccessKey(t *testing.T) {
+	opt := Opt
+	opt.AuthProxy = "go run proxy_code.go"
+	p := New(context.Background(), &opt, &vfscommon.Opt)
+	defer p.Shutdown()
+
+	// Disable refresh rate limiting for this test
+	oldInterval := accessKeyRefreshInterval
+	accessKeyRefreshInterval = 0
+	defer func() { accessKeyRefreshInterval = oldInterval }()
+
+	VFS, secret, err := p.CallAccessKey("AKID", false)
+	require.NoError(t, err)
+	require.NotNil(t, VFS)
+	assert.Equal(t, "AKID-secret", secret)
+
+	// Check the cached entry is returned on the next call
+	VFS2, secret2, err := p.CallAccessKey("AKID", false)
+	require.NoError(t, err)
+	assert.Same(t, VFS, VFS2)
+	assert.Equal(t, secret, secret2)
+
+	// Check a different access key ID gets a different backend
+	VFS3, secret3, err := p.CallAccessKey("OTHER", false)
+	require.NoError(t, err)
+	assert.NotSame(t, VFS, VFS3)
+	assert.Equal(t, "OTHER-secret", secret3)
+
+	// Check a refresh with an unchanged secret keeps the cached backend
+	VFS4, secret4, err := p.CallAccessKey("AKID", true)
+	require.NoError(t, err)
+	assert.Same(t, VFS, VFS4)
+	assert.Equal(t, secret, secret4)
+
+	// Check a refresh with a changed secret returns the new secret.
+	// The VFS is the same object as vfs.New shares a live VFS for the
+	// same backend and options, which keeps requests in flight under
+	// the old secret working.
+	t.Setenv("RCLONE_TEST_PROXY_SECRET_SUFFIX", "-rotated")
+	entries := p.vfsCache.Entries()
+	VFS5, secret5, err := p.CallAccessKey("AKID", true)
+	require.NoError(t, err)
+	assert.Same(t, VFS, VFS5)
+	assert.Equal(t, "AKID-rotated", secret5)
+	// The old entry is retired rather than dropped
+	assert.Equal(t, entries+1, p.vfsCache.Entries())
+	// and can't be reached by naming it as an access key ID with
+	// the old secret
+	_, retiredFound := p.vfsCache.GetMaybe(retiredAccessKeyCacheKey("AKID", "AKID-secret"))
+	assert.True(t, retiredFound)
+	assert.NotContains(t, retiredAccessKeyCacheKey("AKID", "AKID-secret"), "AKID-secret")
+
+	// Check a proxy which doesn't return the secret is an error
+	_, _, err = p.CallAccessKey("nosecret", false)
+	require.ErrorContains(t, err, "_secret_access_key not set")
+
+	// Check a proxy which returns an empty secret is an error
+	_, _, err = p.CallAccessKey("emptysecret", false)
+	require.ErrorContains(t, err, "_secret_access_key is empty")
+
+	// Check a cached entry without a secret, eg one made by password
+	// auth, is never handed out for access key auth
+	_, _, err = p.Call("pwuser", "pass", false)
+	require.NoError(t, err)
+	_, _, err = p.CallAccessKey("pwuser", false)
+	require.ErrorContains(t, err, "no secret access key")
+
+	// Check refreshes are rate limited: with a long interval a
+	// refresh returns the cached secret without running the proxy
+	accessKeyRefreshInterval = time.Hour
+	t.Setenv("RCLONE_TEST_PROXY_SECRET_SUFFIX", "-rotated-again")
+	VFS6, secret6, err := p.CallAccessKey("AKID", true)
+	require.NoError(t, err)
+	assert.Same(t, VFS5, VFS6)
+	assert.Equal(t, "AKID-rotated", secret6)
+
+	// And with no interval the proxy is run and the rotation seen
+	accessKeyRefreshInterval = 0
+	_, secret7, err := p.CallAccessKey("AKID", true)
+	require.NoError(t, err)
+	assert.Equal(t, "AKID-rotated-again", secret7)
+
+	// Check a cached entry is revalidated with the proxy once it is
+	// old enough even without a refresh being asked for
+	oldRevalidate := accessKeyRevalidateInterval
+	defer func() { accessKeyRevalidateInterval = oldRevalidate }()
+	t.Setenv("RCLONE_TEST_PROXY_REVOKED", "AKID")
+	_, secret8, err := p.CallAccessKey("AKID", false)
+	require.NoError(t, err, "cached entry should still be trusted")
+	assert.Equal(t, "AKID-rotated-again", secret8)
+	accessKeyRevalidateInterval = 0
+	_, _, err = p.CallAccessKey("AKID", false)
+	require.ErrorContains(t, err, "revoked")
 }
